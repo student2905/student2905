@@ -1,0 +1,221 @@
+name: Windows Remote Session
+
+on:
+  workflow_dispatch:
+
+jobs:
+  session-runner:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        worker: [1, 2, 3, 4, 5]
+
+    steps:
+
+      - name: Initial Random Delay
+        shell: powershell
+        run: |
+          $waitTime = Get-Random -Minimum 10 -Maximum 40
+          Write-Host "Waiting $waitTime seconds..."
+          Start-Sleep -Seconds $waitTime
+
+
+      - name: Enable Windows Remote Desktop
+        shell: powershell
+        run: |
+          $rdpPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server"
+
+          try {
+              Set-ItemProperty `
+                -Path $rdpPath `
+                -Name "fDenyTSConnections" `
+                -Type DWord `
+                -Value 0
+
+              Get-NetFirewallRule `
+                -DisplayGroup "Remote Desktop" `
+                -ErrorAction SilentlyContinue |
+                Enable-NetFirewallRule `
+                -ErrorAction SilentlyContinue
+
+              Write-Host "Remote Desktop enabled."
+          }
+          catch {
+              Write-Host "Unable to configure Remote Desktop."
+          }
+
+
+      - name: Create Remote Account
+        shell: powershell
+        run: |
+          $loginName = "runner$env:GITHUB_RUN_NUMBER"
+
+          $pool = 33..126 | ForEach-Object {
+              [char]$_
+          }
+
+          $loginPassword = -join (
+              $pool | Get-Random -Count 12
+          )
+
+          $passwordObject = ConvertTo-SecureString `
+              $loginPassword `
+              -AsPlainText `
+              -Force
+
+          try {
+              $existing = Get-LocalUser `
+                  -Name $loginName `
+                  -ErrorAction SilentlyContinue
+
+              if (-not $existing) {
+
+                  New-LocalUser `
+                      -Name $loginName `
+                      -Password $passwordObject `
+                      -AccountNeverExpires
+
+                  Add-LocalGroupMember `
+                      -Group "Administrators" `
+                      -Member $loginName
+
+                  Write-Host "Account created: $loginName"
+              }
+          }
+          catch {
+              Write-Host "Account creation encountered an error."
+          }
+
+          Add-Content `
+              -Path $env:GITHUB_ENV `
+              -Value "R_USER=$loginName"
+
+          Add-Content `
+              -Path $env:GITHUB_ENV `
+              -Value "R_PASS=$loginPassword"
+
+
+      - name: Download Tailscale
+        shell: powershell
+        run: |
+          $downloadUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $package = Join-Path $env:TEMP "tailscale-installer.msi"
+
+          Invoke-WebRequest `
+              -Uri $downloadUrl `
+              -OutFile $package
+
+          Write-Host "Installing Tailscale..."
+
+          Start-Process `
+              -FilePath "msiexec.exe" `
+              -ArgumentList "/i `"$package`" /quiet /norestart" `
+              -Wait
+
+          Remove-Item $package -Force -ErrorAction SilentlyContinue
+
+
+      - name: Connect Worker To Tailscale
+        shell: powershell
+        run: |
+          $tailscale = Join-Path `
+              $env:ProgramFiles `
+              "Tailscale\tailscale.exe"
+
+          $workerId = "${{ matrix.worker }}"
+          $machineName = "worker-$env:GITHUB_RUN_ID-$workerId"
+
+          $loggedIn = $false
+
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+
+              Write-Host "Tailscale connection attempt $attempt"
+
+              & $tailscale up `
+                --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" `
+                --hostname="$machineName" `
+                --reset
+
+              Start-Sleep -Seconds 10
+
+              $state = & $tailscale status 2>&1
+
+              if ($state -notmatch "NeedsLogin") {
+                  $loggedIn = $true
+                  break
+              }
+
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $loggedIn) {
+              throw "Tailscale connection failed."
+          }
+
+          $address = $null
+
+          for ($check = 1; $check -le 5; $check++) {
+
+              $address = (& $tailscale ip -4 2>$null).Trim()
+
+              if (-not [string]::IsNullOrWhiteSpace($address)) {
+                  break
+              }
+
+              Start-Sleep -Seconds 5
+          }
+
+          if ([string]::IsNullOrWhiteSpace($address)) {
+              throw "Tailscale IPv4 address unavailable."
+          }
+
+          Add-Content `
+              -Path $env:GITHUB_ENV `
+              -Value "R_HOST=$address"
+
+          Write-Host "Tailscale address obtained."
+
+
+      - name: Print Remote Access Information
+        shell: powershell
+        run: |
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "        WINDOWS SESSION INFO"
+          Write-Host "======================================"
+          Write-Host "Worker : ${{ matrix.worker }}"
+          Write-Host "Host   : $env:R_HOST"
+          Write-Host "User   : $env:R_USER"
+          Write-Host "Pass   : $env:R_PASS"
+          Write-Host "======================================"
+          Write-Host ""
+
+
+      - name: Maintain Session
+        shell: powershell
+        run: |
+          $duration = [TimeSpan]::FromHours(6)
+          $stopAt = (Get-Date).Add($duration)
+
+          Write-Host "Session will remain active until $stopAt"
+
+          while ($true) {
+
+              if ((Get-Date) -ge $stopAt) {
+                  break
+              }
+
+              $processCount = @(Get-Process).Count
+
+              Write-Host "Active processes: $processCount"
+
+              $sleepSeconds = Get-Random -Minimum 120 -Maximum 300
+
+              Start-Sleep -Seconds $sleepSeconds
+          }
+
+          Write-Host "Six-hour session completed."
